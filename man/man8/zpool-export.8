@@ -39,6 +39,11 @@ The devices can be moved between systems
 and imported as long as a sufficient number of devices are present.
 .Pp
 Before exporting the pool, all datasets within the pool are unmounted.
+Datasets whose mountpoints are not nested in one another are unmounted in
+parallel; see
+.Sy ZFS_UNMOUNT_PARALLELISM
+in
+.Xr zpool 8 .
 A pool can not be exported if it has a shared spare that is currently being
 used.
 .Pp

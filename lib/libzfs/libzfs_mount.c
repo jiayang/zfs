@@ -52,6 +52,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -573,14 +574,11 @@ zfs_mount_at(zfs_handle_t *zhp, const char *options, int flags,
 }
 
 /*
- * Unmount a single filesystem.
+ * Report a do_unmount() error for the given mountpoint.
  */
 static int
-unmount_one(zfs_handle_t *zhp, const char *mountpoint, int flags)
+unmount_error(zfs_handle_t *zhp, const char *mountpoint, int error)
 {
-	int error;
-
-	error = do_unmount(zhp, mountpoint, flags);
 	if (error != 0) {
 		int libzfs_err;
 
@@ -613,6 +611,16 @@ unmount_one(zfs_handle_t *zhp, const char *mountpoint, int flags)
 	}
 
 	return (0);
+}
+
+/*
+ * Unmount a single filesystem.
+ */
+static int
+unmount_one(zfs_handle_t *zhp, const char *mountpoint, int flags)
+{
+	return (unmount_error(zhp, mountpoint,
+	    do_unmount(zhp, mountpoint, flags)));
 }
 
 /*
@@ -1366,6 +1374,8 @@ out:
 struct sets_s {
 	char *mountpoint;
 	zfs_handle_t *dataset;
+	int depth;	/* number of path components in mountpoint */
+	int error;	/* do_unmount() result in a parallel unmount */
 };
 
 static int
@@ -1375,6 +1385,145 @@ mountpoint_compare(const void *a, const void *b)
 	const struct sets_s *mountb = (struct sets_s *)b;
 
 	return (strcmp(mountb->mountpoint, mounta->mountpoint));
+}
+
+/*
+ * Deepest mountpoints first. mountpoint_compare() as a tie-break keeps mounts
+ * stacked on one path adjacent.
+ */
+static int
+mountpoint_depth_compare(const void *a, const void *b)
+{
+	const struct sets_s *mounta = (struct sets_s *)a;
+	const struct sets_s *mountb = (struct sets_s *)b;
+
+	if (mounta->depth != mountb->depth)
+		return (mounta->depth < mountb->depth ? 1 : -1);
+	return (mountpoint_compare(a, b));
+}
+
+static int
+mountpoint_depth(const char *mountpoint)
+{
+	int depth = 0;
+
+	for (const char *p = mountpoint; *p != '\0'; p++) {
+		if (*p != '/' && (p == mountpoint || p[-1] == '/'))
+			depth++;
+	}
+	return (depth);
+}
+
+/*
+ * Number of threads for unmounting a pool's filesystems on export. Override
+ * with ZFS_UNMOUNT_PARALLELISM; a value of 1 or less unmounts serially.
+ */
+#define	ZFS_UNMOUNT_PARALLELISM_DEFAULT	128
+
+static int
+unmount_nthr(void)
+{
+	const char *env = getenv("ZFS_UNMOUNT_PARALLELISM");
+	char *end;
+	long nthr;
+
+	if (env == NULL)
+		return (ZFS_UNMOUNT_PARALLELISM_DEFAULT);
+	errno = 0;
+	nthr = strtol(env, &end, 10);
+	if (errno != 0 || end == env || *end != '\0')
+		return (ZFS_UNMOUNT_PARALLELISM_DEFAULT);
+	return (nthr < 1 ? 1 : (nthr > INT_MAX ? INT_MAX : (int)nthr));
+}
+
+typedef struct unmount_param {
+	struct sets_s	*um_sets;
+	int		um_count;	/* mounts stacked on one path */
+	int		um_flags;
+} unmount_param_t;
+
+/*
+ * Thread pool function to unmount every mount stacked on one path, topmost
+ * first. Stops at the first failure.
+ */
+static void
+zfs_unmount_task(void *arg)
+{
+	unmount_param_t *up = arg;
+
+	for (int i = 0; i < up->um_count; i++) {
+		struct sets_s *set = &up->um_sets[i];
+
+		set->error = do_unmount(set->dataset, set->mountpoint,
+		    up->um_flags);
+		if (set->error != 0)
+			break;
+	}
+}
+
+/*
+ * Unmount the filesystems in sets in parallel. A mountpoint nested under
+ * another always has more path components, so mounts at equal depth never
+ * conflict: unmount one depth at a time, deepest first, with every path at
+ * that depth in parallel. On Linux each unmount ends in txg_wait_synced(), and
+ * concurrent unmounts share txgs, so this avoids a txg sync per filesystem.
+ *
+ * Each failure is reported once its depth completes, and no shallower
+ * filesystems are unmounted. Sorts sets by depth.
+ */
+static int
+unmount_parallel(libzfs_handle_t *hdl, struct sets_s *sets, int used,
+    int flags, int nthr)
+{
+	unmount_param_t *params;
+	taskq_t *tq;
+	int ret = 0;
+
+	for (int i = 0; i < used; i++) {
+		sets[i].depth = mountpoint_depth(sets[i].mountpoint);
+		sets[i].error = 0;
+	}
+	qsort(sets, used, sizeof (struct sets_s), mountpoint_depth_compare);
+
+	if ((params = zfs_alloc(hdl, used * sizeof (unmount_param_t))) == NULL)
+		return (-1);
+	tq = taskq_create("zpool_disable_datasets", MIN(nthr, used),
+	    minclsyspri, 1, INT_MAX, TASKQ_DYNAMIC);
+
+	for (int i = 0; i < used && ret == 0; ) {
+		int first = i;
+
+		/* Dispatch one task per distinct path at this depth. */
+		while (i < used && sets[i].depth == sets[first].depth) {
+			unmount_param_t *up = &params[i];
+
+			up->um_sets = &sets[i];
+			up->um_count = 1;
+			up->um_flags = flags;
+			while (i + up->um_count < used &&
+			    strcmp(sets[i + up->um_count].mountpoint,
+			    sets[i].mountpoint) == 0)
+				up->um_count++;
+			i += up->um_count;
+
+			if (taskq_dispatch(tq, zfs_unmount_task, up,
+			    TQ_SLEEP) == TASKQID_INVALID) {
+				/* Could not dispatch; execute directly */
+				zfs_unmount_task(up);
+			}
+		}
+		taskq_wait(tq);
+
+		for (int j = first; j < i; j++) {
+			if (unmount_error(sets[j].dataset, sets[j].mountpoint,
+			    sets[j].error) != 0)
+				ret = -1;
+		}
+	}
+
+	taskq_destroy(tq);
+	free(params);
+	return (ret);
 }
 
 /*
@@ -1393,7 +1542,7 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 	size_t namelen;
 	struct sets_s *sets = NULL;
 	libzfs_handle_t *hdl = zhp->zpool_hdl;
-	int i;
+	int i, nthr;
 	int ret = -1;
 	int flags = (force ? MS_FORCE : 0);
 
@@ -1475,10 +1624,16 @@ zpool_disable_datasets(zpool_handle_t *zhp, boolean_t force)
 	 * Now unmount everything, removing the underlying directories as
 	 * appropriate.
 	 */
-	for (i = 0; i < used; i++) {
-		if (unmount_one(sets[i].dataset, sets[i].mountpoint,
-		    flags) != 0)
+	nthr = unmount_nthr();
+	if (nthr > 1 && used > 1) {
+		if (unmount_parallel(hdl, sets, used, flags, nthr) != 0)
 			goto out;
+	} else {
+		for (i = 0; i < used; i++) {
+			if (unmount_one(sets[i].dataset, sets[i].mountpoint,
+			    flags) != 0)
+				goto out;
+		}
 	}
 
 	for (i = 0; i < used; i++) {
